@@ -6,6 +6,8 @@
  ===============================================================================
 """
 
+import base64
+import html
 import json
 import os
 import sys
@@ -55,13 +57,41 @@ SUPPORTED_AUDIO_EXTENSIONS = LOSSLESS_AUDIO_EXTENSIONS + LOSSY_AUDIO_EXTENSIONS
 def calculate_true_peak_env(signal_channel):
     """
     Computes the 4x polyphase FIR interpolated magnitude envelope (ITU-R BS.1770-4 Annex 2).
-    Exact 1:1 mathematical parity with the gen~ codebox in Camelot_Pro.amxd.
+    Exact 1:1 mathematical parity with the gen~ codebox in Camelot_Pro.amxd, including
+    10-sample group-delay alignment for y0 and 10-sample tail padding.
+    Uses chunked processing with overlap to keep peak RAM low on long high-SR files.
     """
-    y0 = np.abs(signal_channel)
-    y1 = np.abs(signal.lfilter(ITU_TP_H1, [1.0], signal_channel))
-    y2 = np.abs(signal.lfilter(ITU_TP_H2, [1.0], signal_channel))
-    y3 = np.abs(signal.lfilter(ITU_TP_H3, [1.0], signal_channel))
-    return np.maximum(np.maximum(y0, y1), np.maximum(y2, y3))
+    n = len(signal_channel)
+    if n == 0:
+        return np.zeros(0, dtype=np.float32)
+
+    out = np.empty(n, dtype=np.float32)
+    chunk_size = 524288
+    pad_left = 20   # FIR length - 1
+    pad_right = 10  # Group delay
+
+    for start in range(0, n, chunk_size):
+        end = min(n, start + chunk_size)
+        seg_start = max(0, start - pad_left)
+        seg_end = min(n, end + pad_right)
+        left_zeros = (start - pad_left) < 0
+        right_zeros = (end + pad_right) - seg_end
+
+        seg = np.asarray(signal_channel[seg_start:seg_end], dtype=np.float64)
+        pre = pad_left - (start - seg_start) if left_zeros else 0
+        if pre > 0 or right_zeros > 0:
+            seg = np.pad(seg, (pre, right_zeros), mode='constant')
+
+        # Valid output samples for [start:end] start at index (pad_left + 10) after lfilter
+        offset = pad_left + 10
+        length = end - start
+        y0 = np.abs(signal_channel[start:end])
+        y1 = np.abs(signal.lfilter(ITU_TP_H1, [1.0], seg)[offset:offset + length])
+        y2 = np.abs(signal.lfilter(ITU_TP_H2, [1.0], seg)[offset:offset + length])
+        y3 = np.abs(signal.lfilter(ITU_TP_H3, [1.0], seg)[offset:offset + length])
+        out[start:end] = np.maximum(np.maximum(y0, y1), np.maximum(y2, y3)).astype(np.float32)
+
+    return out
 
 
 def calculate_true_peak_itu(signal_channel):
@@ -83,12 +113,13 @@ def calculate_true_peak_universal(y, audio_path=""):
     ext = Path(str(audio_path)).suffix.lower() if audio_path else ""
     is_lossy = ext in LOSSY_AUDIO_EXTENSIONS
 
-    if y.ndim > 1:
+    if y.ndim > 1 and y.shape[1] >= 2:
         tp_env = np.maximum(calculate_true_peak_env(y[:, 0]), calculate_true_peak_env(y[:, 1]))
         sp_env = np.maximum(np.abs(y[:, 0]), np.abs(y[:, 1]))
     else:
-        tp_env = calculate_true_peak_env(y)
-        sp_env = np.abs(y)
+        y_1d = y[:, 0] if y.ndim > 1 else y
+        tp_env = calculate_true_peak_env(y_1d)
+        sp_env = np.abs(y_1d)
 
     raw_tp_val = float(np.max(tp_env))
     raw_sp_val = float(np.max(sp_env))
@@ -148,6 +179,7 @@ def load_audio_robust(audio_path):
                     ["/usr/bin/afconvert", "-f", "WAVE", "-d", "LEF32", str(audio_path), tmp_wav],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
+                    timeout=60,
                 )
                 if res.returncode == 0 and os.path.exists(tmp_wav) and os.path.getsize(tmp_wav) > 1024:
                     y, sr = sf.read(tmp_wav, always_2d=False)
@@ -167,6 +199,7 @@ def load_audio_robust(audio_path):
                         [ffmpeg_bin, "-y", "-i", str(audio_path), "-vn", "-acodec", "pcm_f32le", tmp_wav],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
+                        timeout=60,
                     )
                     if res.returncode == 0 and os.path.exists(tmp_wav) and os.path.getsize(tmp_wav) > 1024:
                         y, sr = sf.read(tmp_wav, always_2d=False)
@@ -214,17 +247,30 @@ def analyze_audio(audio_path):
         is_stereo = False
         mono_signal = y_1d
 
-    # A. LUFS Calculation (EBU R128)
+    # A. LUFS Calculation (EBU R128) — handle short clips (< 0.4s) & pure silence (-inf)
     meter = pyln.Meter(sr)
-    integrated_lufs = meter.integrated_loudness(y)
+    min_samples = int(np.ceil(sr * 0.45))
+    if len(y) < min_samples:
+        pad_len = min_samples - len(y)
+        y_lufs = np.pad(y, ((0, pad_len), (0, 0)), mode='constant') if y.ndim > 1 else np.pad(y, (0, pad_len), mode='constant')
+    else:
+        y_lufs = y
+
+    integrated_lufs = float(meter.integrated_loudness(y_lufs))
+    if np.isnan(integrated_lufs) or np.isneginf(integrated_lufs) or np.isposinf(integrated_lufs):
+        integrated_lufs = -99.0
 
     # Vectorized Momentary LUFS (400ms window) max from meter.blockwise_loudness
-    valid_m = [float(l) for l in meter.blockwise_loudness if not np.isneginf(l) and not np.isnan(l)]
-    momentary_lufs_max = max(valid_m) if valid_m else integrated_lufs
+    blockwise = getattr(meter, "blockwise_loudness", None)
+    if blockwise is not None:
+        valid_m = [float(l) for l in blockwise if not np.isneginf(l) and not np.isnan(l)]
+        momentary_lufs_max = max(valid_m) if valid_m else integrated_lufs
+    else:
+        momentary_lufs_max = integrated_lufs
 
     # Vectorized Short-Term LUFS (3.0s window = 30 blocks of 100ms)
-    if len(meter.blockwise_loudness) >= 30:
-        bw_arr = np.array(meter.blockwise_loudness, dtype=np.float64)
+    if blockwise is not None and len(blockwise) >= 30:
+        bw_arr = np.array(blockwise, dtype=np.float64)
         bw_clean = np.where(np.isnan(bw_arr) | np.isneginf(bw_arr), -120.0, bw_arr)
         z_blocks = np.where(bw_clean <= -119.0, 0.0, 10.0 ** ((bw_clean + 0.691) / 10.0))
         kernel_st = np.ones(30) / 30.0
@@ -326,7 +372,7 @@ def analyze_audio(audio_path):
         "High (>8 kHz)": (8000.0, max(8500.0, nyq))
     }
 
-    nperseg = 8192
+    nperseg = min(8192, max(1, len(mono_signal)))
     if is_stereo:
         freqs, _, Zxx_L = signal.stft(left, fs=sr, nperseg=nperseg)
         _, _, Zxx_R = signal.stft(right, fs=sr, nperseg=nperseg)
@@ -666,24 +712,29 @@ def format_param_value(par):
     return par.get("value", "")
 
 
+def esc(val):
+    """Safely HTML-escapes any value for interpolation into HTML content or attributes."""
+    return html.escape(str(val if val is not None else ""), quote=True)
+
+
 def format_clean_sends(sends):
     if not sends:
         return '<span style="color:#64748b;">—</span>'
     active = []
     for idx, s in enumerate(sends):
         if isinstance(s, dict):
-            s_idx = s.get("send_index", idx + 1)
+            s_idx = esc(s.get("send_index", idx + 1))
             s_disp = s.get("display", "")
             if isinstance(s_disp, str) and s_disp.strip() and "bound method" not in s_disp and "object at" not in s_disp:
                 if "-inf" not in s_disp.lower() and "-70" not in s_disp:
-                    active.append(f'<span class="send-badge">S{s_idx}: {s_disp}</span>')
+                    active.append(f'<span class="send-badge">S{s_idx}: {esc(s_disp)}</span>')
                 continue
             db = s.get("db", -70.0)
             if isinstance(db, (int, float)) and db > -69.0:
-                active.append(f'<span class="send-badge">S{s_idx}: {db}dB</span>')
+                active.append(f'<span class="send-badge">S{s_idx}: {esc(db)}dB</span>')
         elif isinstance(s, (int, float)):
             if s > -69.0:
-                active.append(f'<span class="send-badge">S{idx+1}: {s}dB</span>')
+                active.append(f'<span class="send-badge">S{idx+1}: {esc(s)}dB</span>')
     return "".join(active) if active else '<span style="color:#64748b;">—</span>'
 
 def render_devices_compact(devices):
@@ -691,7 +742,7 @@ def render_devices_compact(devices):
         return '<span class="plugin-empty">Nessun Plugin</span>'
     chips = []
     for d in devices:
-        p_name = d.get("name", "Unknown")
+        p_name = esc(d.get("name", "Unknown"))
         is_on = is_device_effectively_active(d)
         dot_color = "#34d399" if is_on else "#f43f5e"
         
@@ -703,8 +754,8 @@ def render_devices_compact(devices):
         if params:
             param_items = []
             for par in params:
-                p_label = par.get("name", "")
-                p_val = format_param_value(par)
+                p_label = esc(par.get("name", ""))
+                p_val = esc(format_param_value(par))
                 is_auto = par.get("is_automated", False)
                 auto_icon = "⚡ " if is_auto else ""
                 color_style = "color:#fbbf24;" if is_auto else "color:#cbd5e1;"
@@ -836,7 +887,7 @@ def render_tree_node_html(node, depth=0):
 
     # Search keywords
     plugin_names = " ".join([d.get("name", "") for d in devices]).lower()
-    search_data = f'data-name="{name.lower()}" data-plugins="{plugin_names}"'
+    search_data = f'data-name="{esc(name.lower())}" data-plugins="{esc(plugin_names)}"'
 
     children_html = ""
     if children:
@@ -848,8 +899,8 @@ def render_tree_node_html(node, depth=0):
         <summary class="tree-summary">
             <span class="tree-chevron">▶</span>
             {type_badge}
-            <span class="tree-title">{name}</span>
-            <span class="mixer-pill">Vol: <b>{vol_db} dB</b> | Pan: <b>{pan}</b></span>
+            <span class="tree-title">{esc(name)}</span>
+            <span class="mixer-pill">Vol: <b>{esc(vol_db)} dB</b> | Pan: <b>{esc(pan)}</b></span>
             <span class="sends-pill">Sends: {sends_rendered}</span>
             {dev_badge}
             <div class="tree-inline-plugins">{devices_html}</div>
@@ -860,8 +911,31 @@ def render_tree_node_html(node, depth=0):
     </details>
     """
 
+def get_brand_icon_data_uri():
+    """Loads Camelot Pro icon as a self-contained data URI for HTML favicon and header logo."""
+    script_dir = Path(__file__).resolve().parent
+    for fname in ("Camelot_Pro_Icon_128.png", "Camelot_Pro_Icon.png"):
+        icon_path = script_dir / fname
+        if icon_path.exists():
+            try:
+                b64 = base64.b64encode(icon_path.read_bytes()).decode("ascii")
+                return f"data:image/png;base64,{b64}"
+            except OSError:
+                pass
+    return ""
+
+
 def generate_html_report(audio_metrics, session_data, output_path):
     """Generates a stunning, compact, hierarchical HTML dashboard report."""
+
+    brand_icon_uri = get_brand_icon_data_uri()
+    favicon_tags = (
+        f'    <link rel="icon" type="image/png" href="{brand_icon_uri}">\n'
+        f'    <link rel="apple-touch-icon" href="{brand_icon_uri}">'
+    ) if brand_icon_uri else ""
+    brand_logo_html = (
+        f'<img src="{brand_icon_uri}" alt="CAMELOT PRO" class="brand-logo">'
+    ) if brand_icon_uri else "🗡️"
 
     sess_info = session_data.get("Session_Info", {}) if session_data else {}
     tracks = session_data.get("Tracks", []) if session_data else []
@@ -1009,12 +1083,12 @@ def generate_html_report(audio_metrics, session_data, output_path):
     master_dev_count = len(master_devs)
 
     master_tree_html = f"""
-    <details class="tree-item tree-master depth-0" open data-name="master" data-plugins="{" ".join([d.get("name","") for d in master_devs]).lower()}">
+    <details class="tree-item tree-master depth-0" open data-name="master" data-plugins="{esc(" ".join([d.get("name","") for d in master_devs]).lower())}">
         <summary class="tree-summary master-summary">
             <span class="tree-chevron">▶</span>
             <span class="badge badge-master">👑 TRACCIA MASTER</span>
             <span class="tree-title" style="font-size:1.15rem; color:#f8fafc;">Master Bus & Sub-Gruppi</span>
-            <span class="mixer-pill">Vol: <b>{master_vol} dB</b> | Pan: <b>{master_pan}</b></span>
+            <span class="mixer-pill">Vol: <b>{esc(master_vol)} dB</b> | Pan: <b>{esc(master_pan)}</b></span>
             <span class="badge badge-count">{master_dev_count} FX Master</span>
             <div class="tree-inline-plugins">{master_devs_html}</div>
         </summary>
@@ -1032,7 +1106,8 @@ def generate_html_report(audio_metrics, session_data, output_path):
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CAMELOT PRO Telemetry & Mix Advisor - {audio_metrics.get('file_name', 'Session')}</title>
+    <title>CAMELOT PRO Telemetry & Mix Advisor - {esc(audio_metrics.get('file_name', 'Session'))}</title>
+{favicon_tags}
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700;800&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
@@ -1069,6 +1144,20 @@ def generate_html_report(audio_metrics, session_data, output_path):
             padding: 1.75rem 2rem;
             margin-bottom: 2rem;
             backdrop-filter: blur(14px);
+        }}
+
+        .header-brand {{
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }}
+
+        .brand-logo {{
+            width: 56px;
+            height: 56px;
+            border-radius: 13px;
+            box-shadow: 0 0 18px rgba(56, 189, 248, 0.35);
+            flex-shrink: 0;
         }}
 
         .header h1 {{
@@ -1531,14 +1620,17 @@ def generate_html_report(audio_metrics, session_data, output_path):
 <body>
 
     <div class="header">
-        <div>
-            <h1>🗡️ CAMELOT PRO TELEMETRY & ADVISOR</h1>
-            <p style="color: var(--text-muted); margin-top: 4px;">Analisi Spettrale, Standard Commerciali Hip Hop/Trap e Struttura Sessione</p>
+        <div class="header-brand">
+            {brand_logo_html}
+            <div>
+                <h1>CAMELOT PRO TELEMETRY & ADVISOR</h1>
+                <p style="color: var(--text-muted); margin-top: 4px;">Analisi Spettrale, Standard Commerciali Hip Hop/Trap e Struttura Sessione</p>
+            </div>
         </div>
         <div class="session-meta">
-            <div>FILE: <b>{audio_metrics.get('file_name', 'Session')}</b></div>
-            <div>BPM: <b>{sess_info.get('BPM', 'N/A')}</b></div>
-            <div>METRUM: <b>{sess_info.get('Time_Signature_Num', 4)}/{sess_info.get('Time_Signature_Den', 4)}</b></div>
+            <div>FILE: <b>{esc(audio_metrics.get('file_name', 'Session'))}</b></div>
+            <div>BPM: <b>{esc(sess_info.get('BPM', 'N/A'))}</b></div>
+            <div>METRUM: <b>{esc(sess_info.get('Time_Signature_Num', 4))}/{esc(sess_info.get('Time_Signature_Den', 4))}</b></div>
         </div>
     </div>
 
@@ -1698,7 +1790,16 @@ def generate_html_report(audio_metrics, session_data, output_path):
                         parent = parent.parentElement;
                     }}
                 }} else {{
-                    const childMatches = el.querySelectorAll(`.tree-item[data-name*="${{q}}"], .tree-item[data-plugins*="${{q}}"]`).length > 0;
+                    const descendants = el.querySelectorAll('.tree-item');
+                    let childMatches = false;
+                    for (let i = 0; i < descendants.length; i++) {{
+                        const cName = descendants[i].getAttribute('data-name') || '';
+                        const cPlugins = descendants[i].getAttribute('data-plugins') || '';
+                        if (cName.includes(q) || cPlugins.includes(q)) {{
+                            childMatches = true;
+                            break;
+                        }}
+                    }}
                     if (childMatches) {{
                         el.style.display = '';
                         el.open = true;

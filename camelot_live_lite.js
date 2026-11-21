@@ -3,13 +3,14 @@
  CAMELOT LIVE LITE - REAL-TIME AUDIO TELEMETRY ENGINE (Max for Live JS)
  High-Performance, Ultra-Low CPU Audio Telemetry Engine for Ableton Live
  Conforming to ITU-R BS.1770-4, EBU R128 & AES-17 Standards
- Full Session Integration: Integrated LUFS, Integrated RMS, Max Peak, Integrated Crest
+ Full Session Integration: Integrated LUFS, Dual-Gated RMS, Max Peak, Crest
+ Dynamic Sample-Rate K-Weighting & Window Adaptation (44.1 / 48 / 88.2 / 96+ kHz)
  ===============================================================================
 */
 
 autowatch = 1;
 inlets = 1;
-outlets = 8;
+outlets = 9;
 // Outlet 0: LUFS Momentary (float LUFS)
 // Outlet 1: LUFS Short-Term (float LUFS)
 // Outlet 2: LUFS Integrated (float LUFS)
@@ -18,6 +19,7 @@ outlets = 8;
 // Outlet 5: Phase Correlation (-1.00 to +1.00)
 // Outlet 6: [% Mid, % Side, M/S ratio dB]
 // Outlet 7: Status / Text Alert string
+// Outlet 8: DSP Config messages (k_shelf, k_hp, rms_win, k_win, phase_win)
 
 // Constants
 var EPSILON = 1e-12;
@@ -27,7 +29,7 @@ var MOMENTARY_BLOCKS = Math.max(1, Math.round(0.4 * TICK_RATE_HZ)); // 400ms = 8
 var SHORTTERM_BLOCKS = Math.max(1, Math.round(3.0 * TICK_RATE_HZ)); // 3.0s = 60 blocks
 
 // Internal State
-var sampleRate = 44100;
+var sampleRate = 48000;
 var isPlaying = false; // Default to false until Live transport starts!
 
 // Loudness Buffers
@@ -48,9 +50,17 @@ var histTotalCount = 0;
 var lastIntegratedLUFS = -99.0;
 var lastProcessTime = 0;
 
-// Session-Integrated Metrics Accumulators
-var rmsAccumEnergy = 0.0;
-var rmsAccumCount = 0;
+// Dual-Gated RMS Histogram (-60.0 to +6.0 dBFS with 0.1 dB bins, parity with camelot.py)
+var RMS_HIST_MIN_DB = -60.0;
+var RMS_HIST_BINS = 661;
+var rmsHistBins = new Array(RMS_HIST_BINS);
+var rmsBinPower = new Array(RMS_HIST_BINS);
+for (var rh = 0; rh < RMS_HIST_BINS; rh++) {
+    rmsHistBins[rh] = 0;
+    var rmsDbInit = RMS_HIST_MIN_DB + (rh * 0.1);
+    rmsBinPower[rh] = Math.pow(10.0, rmsDbInit / 10.0);
+}
+var rmsHistTotalCount = 0;
 var lastIntegratedRMS = -99.0;
 var maxHoldTruePeak = -99.0;
 var lastIntegratedCrest = 0.0;
@@ -58,6 +68,58 @@ var phaseAccumDot = 0.0;
 var phaseAccumEL = 0.0;
 var phaseAccumER = 0.0;
 var lastIntegratedPhase = 0.0;
+
+// Compute exact ITU-R BS.1770-4 K-Weighting biquad coefficients for arbitrary sample rate
+// Returns Max biquad~ order: [b0, b1, b2, a1, a2]
+function compute_k_weighting_coeffs(fs) {
+    var sr = (fs && fs >= 8000) ? fs : 48000;
+
+    // Stage 1: High-Shelf (+3.999843853973347 dB, Q = 0.7071752369554196, fc = 1681.974450955533 Hz)
+    var db = 3.999843853973347;
+    var f0 = 1681.974450955533;
+    var Q = 0.7071752369554196;
+    var K = Math.tan(Math.PI * f0 / sr);
+    var Vh = Math.pow(10.0, db / 20.0);
+    var Vb = Math.pow(Vh, 0.4996667741545416);
+    var a0_s = 1.0 + K / Q + K * K;
+    var shelf = [
+        (Vh + Vb * K / Q + K * K) / a0_s,
+        2.0 * (K * K - Vh) / a0_s,
+        (Vh - Vb * K / Q + K * K) / a0_s,
+        2.0 * (K * K - 1.0) / a0_s,
+        (1.0 - K / Q + K * K) / a0_s
+    ];
+
+    // Stage 2: High-Pass (Q = 0.5003270373238773, fc = 38.13547087602444 Hz)
+    var f0_hp = 38.13547087602444;
+    var Q_hp = 0.5003270373238773;
+    var K_hp = Math.tan(Math.PI * f0_hp / sr);
+    var a0_h = 1.0 + K_hp / Q_hp + K_hp * K_hp;
+    var hp = [
+        1.0,
+        -2.0,
+        1.0,
+        2.0 * (K_hp * K_hp - 1.0) / a0_h,
+        (1.0 - K_hp / Q_hp + K_hp * K_hp) / a0_h
+    ];
+
+    return { shelf: shelf, hp: hp };
+}
+
+function set_sample_rate(sr) {
+    if (!sr || sr < 8000) return;
+    sampleRate = sr;
+    var coeffs = compute_k_weighting_coeffs(sampleRate);
+    var rmsWin = Math.max(64, Math.round(sampleRate * 0.30));    // ~300ms RMS window
+    var kWin = Math.max(32, Math.round(sampleRate * 0.10));      // ~100ms K-weighted block
+    var phaseWin = Math.max(32, Math.round(sampleRate * 0.05));  // ~50ms phase window
+
+    outlet(8, "k_shelf", coeffs.shelf[0], coeffs.shelf[1], coeffs.shelf[2], coeffs.shelf[3], coeffs.shelf[4]);
+    outlet(8, "k_hp", coeffs.hp[0], coeffs.hp[1], coeffs.hp[2], coeffs.hp[3], coeffs.hp[4]);
+    outlet(8, "rms_win", rmsWin);
+    outlet(8, "k_win", kWin);
+    outlet(8, "phase_win", phaseWin);
+}
 
 // Reset All Telemetry Accumulators
 function reset() {
@@ -67,8 +129,8 @@ function reset() {
     histTotalCount = 0;
     lastIntegratedLUFS = -99.0;
 
-    rmsAccumEnergy = 0.0;
-    rmsAccumCount = 0;
+    for (var rh = 0; rh < RMS_HIST_BINS; rh++) rmsHistBins[rh] = 0;
+    rmsHistTotalCount = 0;
     lastIntegratedRMS = -99.0;
     maxHoldTruePeak = -99.0;
     lastIntegratedCrest = 0.0;
@@ -86,10 +148,6 @@ function reset() {
     outlet(5, 0.0);
     outlet(6, [0.0, 0.0, 0.0]);
     outlet(7, "Reset telemetria completato");
-}
-
-function set_sample_rate(sr) {
-    if (sr > 0) sampleRate = sr;
 }
 
 function set_playing(state) {
@@ -120,7 +178,7 @@ function process_telemetry(rms_l, rms_r, peak_l, peak_r, k_pwr_l, k_pwr_r, tp_l,
         return;
     }
 
-    // 0. Always capture maximum True Peak hold immediately across all pak inlet bursts
+    // 0. Capture maximum True Peak hold (guarded against silence floor)
     var cur_tp_lin = Math.max(tp_l || 0.0, tp_r || 0.0, peak_l || 0.0, peak_r || 0.0, EPSILON);
     var cur_tp_db = Math.round(20.0 * (Math.log(cur_tp_lin) / Math.LN10) * 100) / 100;
     if (cur_tp_db > maxHoldTruePeak && cur_tp_lin >= 0.0001) {
@@ -129,7 +187,6 @@ function process_telemetry(rms_l, rms_r, peak_l, peak_r, k_pwr_l, k_pwr_r, tp_l,
 
     var now = new Date().getTime();
     if (now - lastProcessTime < 25) {
-        // Debounce: previene sovracampionamenti multipli generati dai vettori di clock Max pak
         return;
     }
     lastProcessTime = now;
@@ -155,9 +212,6 @@ function process_telemetry(rms_l, rms_r, peak_l, peak_r, k_pwr_l, k_pwr_r, tp_l,
     // -------------------------------------------------------------------------
     // 1. LUFS INTEGRATED CALCULATION (ITU-R BS.1770-4 / EBU R128)
     // -------------------------------------------------------------------------
-    // k_pwr_l and k_pwr_r are linear RMS amplitudes from average~ rms in Max.
-    // According to ITU-R BS.1770-4, mean square energy z_i = (RMS_i)^2.
-    // Channel weighting: G_L = 1.0 (0 dB), G_R = 1.0 (0 dB) -> z = z_L + z_R.
     var p_k_l = k_pwr_l * k_pwr_l;
     var p_k_r = k_pwr_r * k_pwr_r;
     var p_k = Math.max(p_k_l + p_k_r, EPSILON);
@@ -178,7 +232,7 @@ function process_telemetry(rms_l, rms_r, peak_l, peak_r, k_pwr_l, k_pwr_r, tp_l,
     var avg_st = sum_st / shorttermWindow.length;
     var lufs_shortterm = -0.691 + 10.0 * (Math.log(avg_st + EPSILON) / Math.LN10);
 
-    // Integrated LUFS (Dual-Gated Accumulation: Absolute gate at -70.0 LUFS)
+    // Integrated LUFS (Dual-Gated Accumulation: Absolute gate -70 LUFS, Relative gate -10 LU)
     if (lufs_momentary >= HIST_MIN_LUFS) {
         var binIdx = Math.round((lufs_momentary - HIST_MIN_LUFS) * 10);
         if (binIdx >= 0) {
@@ -228,35 +282,53 @@ function process_telemetry(rms_l, rms_r, peak_l, peak_r, k_pwr_l, k_pwr_r, tp_l,
     var lufs_integrated = (histTotalCount > 0) ? lastIntegratedLUFS : -99.0;
 
     // -------------------------------------------------------------------------
-    // 2. TRUE PEAK (MAX PEAK HOLD ACROSS SESSION)
-    // -------------------------------------------------------------------------
-    var max_tp_lin = Math.max(tp_l, tp_r, peak_l, peak_r, EPSILON);
-    var instant_tp_db = 20.0 * (Math.log(max_tp_lin) / Math.LN10);
-    instant_tp_db = Math.round(instant_tp_db * 100) / 100;
-
-    if (instant_tp_db > maxHoldTruePeak) {
-        maxHoldTruePeak = instant_tp_db;
-    }
-
-    // -------------------------------------------------------------------------
-    // 3. RMS (INTEGRATED CUMULATIVE ENERGY AES-17, GATED ABOVE -60 LUFS)
+    // 2. RMS (DUAL-GATED INTEGRATED ENERGY: Abs > -60 dBFS, Rel >= -10 dB)
+    //    Exact mathematical parity with camelot.py
     // -------------------------------------------------------------------------
     var stereo_energy = 0.5 * (rms_energy_l + rms_energy_r) + EPSILON;
     var block_rms_db = 10.0 * (Math.log(stereo_energy) / Math.LN10);
-    if (lufs_momentary >= -60.0 && block_rms_db >= -60.0) {
-        rmsAccumEnergy += stereo_energy;
-        rmsAccumCount++;
+    if (block_rms_db >= RMS_HIST_MIN_DB) {
+        var rmsBinIdx = Math.round((block_rms_db - RMS_HIST_MIN_DB) * 10);
+        if (rmsBinIdx >= 0) {
+            if (rmsBinIdx >= RMS_HIST_BINS) rmsBinIdx = RMS_HIST_BINS - 1;
+            rmsHistBins[rmsBinIdx]++;
+            rmsHistTotalCount++;
+        }
     }
 
-    if (rmsAccumCount > 0) {
-        var meanEnergy = rmsAccumEnergy / rmsAccumCount;
-        var rms_int_db = 10.0 * (Math.log(meanEnergy + EPSILON) / Math.LN10);
-        rms_int_db = Math.round(rms_int_db * 10) / 10;
-        lastIntegratedRMS = rms_int_db;
+    if (rmsHistTotalCount > 0) {
+        var rmsSumAbs = 0.0;
+        var rmsCntAbs = 0;
+        for (var rbi = 0; rbi < RMS_HIST_BINS; rbi++) {
+            var rc = rmsHistBins[rbi];
+            if (rc > 0) {
+                rmsSumAbs += rc * rmsBinPower[rbi];
+                rmsCntAbs += rc;
+            }
+        }
+        if (rmsCntAbs > 0) {
+            var rmsMeanAbs = rmsSumAbs / rmsCntAbs;
+            var rmsAbsDb = 10.0 * (Math.log(rmsMeanAbs + EPSILON) / Math.LN10);
+            var rmsRelThreshDb = rmsAbsDb - 10.0;
+            var rmsRelStart = Math.max(0, Math.floor((rmsRelThreshDb - RMS_HIST_MIN_DB) * 10));
+
+            var rmsSumRel = 0.0;
+            var rmsCntRel = 0;
+            for (var rri = rmsRelStart; rri < RMS_HIST_BINS; rri++) {
+                var rrc = rmsHistBins[rri];
+                if (rrc > 0) {
+                    rmsSumRel += rrc * rmsBinPower[rri];
+                    rmsCntRel += rrc;
+                }
+            }
+            var finalRmsEnergy = (rmsCntRel > 0) ? (rmsSumRel / rmsCntRel) : rmsMeanAbs;
+            var rms_int_db = 10.0 * (Math.log(finalRmsEnergy + EPSILON) / Math.LN10);
+            lastIntegratedRMS = Math.round(rms_int_db * 10) / 10;
+        }
     }
 
     // -------------------------------------------------------------------------
-    // 4. CREST FACTOR (INTEGRATED SESSION DYNAMICS: TP_max - RMS_int)
+    // 3. CREST FACTOR (INTEGRATED SESSION DYNAMICS: TP_max - RMS_int)
     // -------------------------------------------------------------------------
     var integrated_crest = 0.0;
     if (maxHoldTruePeak > -90.0 && lastIntegratedRMS > -90.0) {
@@ -269,7 +341,7 @@ function process_telemetry(rms_l, rms_r, peak_l, peak_r, k_pwr_l, k_pwr_r, tp_l,
     plr_shortterm = Math.round(plr_shortterm * 10) / 10;
 
     // -------------------------------------------------------------------------
-    // 5. L/R PHASE CORRELATION (INTEGRATED CUMULATIVE SESSION COHERENCE)
+    // 4. L/R PHASE CORRELATION (INTEGRATED CUMULATIVE SESSION COHERENCE)
     // -------------------------------------------------------------------------
     var norm_l = Math.sqrt(energy_l + EPSILON);
     var norm_r = Math.sqrt(energy_r + EPSILON);
@@ -291,7 +363,7 @@ function process_telemetry(rms_l, rms_r, peak_l, peak_r, k_pwr_l, k_pwr_r, tp_l,
     }
 
     // -------------------------------------------------------------------------
-    // 6. STEREO WIDTH & MID/SIDE
+    // 5. STEREO WIDTH & MID/SIDE
     // -------------------------------------------------------------------------
     var energy_mid = 0.5 * (energy_l + energy_r + 2.0 * dot_lr);
     var energy_side = 0.5 * (energy_l + energy_r - 2.0 * dot_lr);
@@ -305,7 +377,7 @@ function process_telemetry(rms_l, rms_r, peak_l, peak_r, k_pwr_l, k_pwr_r, tp_l,
     ms_ratio_db = Math.round(ms_ratio_db * 10) / 10;
 
     // -------------------------------------------------------------------------
-    // 7. OUTPUT ROUTING (INTEGRATED METRICS)
+    // 6. OUTPUT ROUTING (INTEGRATED METRICS)
     // -------------------------------------------------------------------------
     outlet(0, lufs_momentary);
     outlet(1, lufs_shortterm);

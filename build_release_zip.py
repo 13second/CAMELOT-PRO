@@ -27,10 +27,16 @@ ESSENTIAL_FILES = [
     "camelot_pro_m4l.js",
     "camelot_pro_runner.js",
     "vectorscope.js",
+    "Camelot_Pro_Icon.png",
+    "Camelot_Pro_Icon_128.png",
+    "Camelot_Pro_Icon.icns",
+    "Camelot_Pro_Icon.ico",
     "requirements.txt",
     "Install_Camelot_Pro.command",
     "Install_Camelot_Pro_Windows.bat",
     "README.txt",
+    "README.md",
+    "LICENSE",
 ]
 
 
@@ -49,7 +55,7 @@ def build_clean_release():
     # Create a placeholder README inside MIX ANALYSIS so the folder is preserved in ZIP
     mix_readme = RELEASE_STAGE_DIR / "MIX ANALYSIS" / "LEGGIMI_MIX_ANALYSIS.txt"
     mix_readme.write_text(
-        "in questa cartella verrano salvati i report esporta qui il file wav della tua sessione\n",
+        "In questa cartella verranno salvati i report: esporta qui il file audio della tua sessione.\n",
         encoding="utf-8",
     )
 

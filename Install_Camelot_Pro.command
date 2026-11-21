@@ -89,9 +89,27 @@ elif [ -d "$HOME/Music/Ableton/User Library" ]; then
     cp -f "$SCRIPT_DIR/camelot_pro_m4l.js" "$TARGET_DIR/" 2>/dev/null
     cp -f "$SCRIPT_DIR/camelot_pro_runner.js" "$TARGET_DIR/" 2>/dev/null
     cp -f "$SCRIPT_DIR/vectorscope.js" "$TARGET_DIR/" 2>/dev/null
+    cp -f "$SCRIPT_DIR/Camelot_Pro_Icon.png" "$TARGET_DIR/" 2>/dev/null
+    cp -f "$SCRIPT_DIR/Camelot_Pro_Icon_128.png" "$TARGET_DIR/" 2>/dev/null
+    cp -f "$SCRIPT_DIR/Camelot_Pro_Icon.icns" "$TARGET_DIR/" 2>/dev/null
+    cp -f "$SCRIPT_DIR/Camelot_Pro_Icon.ico" "$TARGET_DIR/" 2>/dev/null
     cp -f "$SCRIPT_DIR/requirements.txt" "$TARGET_DIR/" 2>/dev/null
     cp -f "$SCRIPT_DIR/README.txt" "$TARGET_DIR/" 2>/dev/null
     xattr -cr "$TARGET_DIR" 2>/dev/null
+    if [ -f "$TARGET_DIR/Camelot_Pro_Icon.icns" ]; then
+        osascript -l JavaScript - "$TARGET_DIR/Camelot_Pro_Icon.icns" "$TARGET_DIR" "$TARGET_DIR/Camelot_Pro.amxd" <<'EOF' 2>/dev/null
+ObjC.import("AppKit");
+function run(argv) {
+    const ws = $.NSWorkspace.sharedWorkspace;
+    const icon = $.NSImage.alloc.initWithContentsOfFile(argv[0]);
+    if (icon && !icon.isNil()) {
+        for (let i = 1; i < argv.length; i++) {
+            ws.setIconForFileOptions(icon, argv[i], 0);
+        }
+    }
+}
+EOF
+    fi
     echo "   ✅ CAMELOT PRO copiato automaticamente nella tua User Library di Ableton:"
     echo "      $TARGET_DIR"
 else

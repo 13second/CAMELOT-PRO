@@ -55,14 +55,9 @@ function scan_and_execute() {
     // 3. Master Track
     result["Master_Track"] = process_track("live_set master_track", "Master", 1);
 
-    // Save to Max Dict dati_out
-    var d = new Dict("dati_out");
-    d.parse(JSON.stringify(result));
-    
-    // Save to file dynamically in device folder
-    var folder = (this.patcher && this.patcher.filepath) ? 
-        this.patcher.filepath.substring(0, this.patcher.filepath.lastIndexOf("/")) : 
-        ".";
+    // Save to file dynamically in device folder (normalize separators for macOS/Windows)
+    var raw_fp = (this.patcher && this.patcher.filepath) ? this.patcher.filepath.replace(/\\/g, "/") : "";
+    var folder = raw_fp ? raw_fp.substring(0, raw_fp.lastIndexOf("/")) : ".";
     session_json_path = folder + "/camelot_session.json";
     
     var json_str = JSON.stringify(result, null, 2);
@@ -174,8 +169,11 @@ function process_track(track_path, track_type_label, index) {
         var is_active = parseInt(dev.get("is_active")) === 1;
 
         var params_list = [];
+        var automated_params = [];
         var num_params = dev.getcount("parameters");
-        for (var p = 0; p < num_params; p++) {
+        var MAX_PARAMS_PER_DEVICE = 96;
+        var param_limit = Math.min(num_params, MAX_PARAMS_PER_DEVICE);
+        for (var p = 0; p < param_limit; p++) {
             var p_path = dev_path + " parameters " + p;
             var param = new LiveAPI(p_path);
             if (!param || param.id == 0) continue;
@@ -185,9 +183,17 @@ function process_track(track_path, track_type_label, index) {
             var p_str = safe_str_for_value(param, p_val);
             var p_min = parseFloat(param.get("min"));
             var p_max = parseFloat(param.get("max"));
+            var p_auto_state = 0;
+            try {
+                p_auto_state = parseInt(param.get("automation_state")) || 0;
+            } catch (e) {}
+            var is_automated = p_auto_state > 0;
 
             if (p_name === "Device On" && p_val === 0) {
                 is_active = false;
+            }
+            if (is_automated) {
+                automated_params.push(p_name);
             }
 
             params_list.push({
@@ -195,17 +201,23 @@ function process_track(track_path, track_type_label, index) {
                 "value": round_val(p_val),
                 "display": p_str || round_val(p_val).toString(),
                 "min": round_val(p_min),
-                "max": round_val(p_max)
+                "max": round_val(p_max),
+                "is_automated": is_automated
             });
         }
 
-        devices_list.push({
+        var dev_obj = {
             "name": dev_name,
             "class": dev_class,
             "active": is_active,
             "is_active": is_active,
+            "automated_params": automated_params,
             "parameters": params_list
-        });
+        };
+        if (num_params > MAX_PARAMS_PER_DEVICE) {
+            dev_obj["parameters_truncated"] = num_params - MAX_PARAMS_PER_DEVICE;
+        }
+        devices_list.push(dev_obj);
     }
 
     return {

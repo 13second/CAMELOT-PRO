@@ -28,6 +28,7 @@ function paint() {
     var cx = width * 0.5;
     var cy = height * 0.5;
     var radius = Math.min(cx, cy) - 9;
+    if (radius <= 2) return;
 
     // 1. Background
     mgraphics.set_source_rgba(0.06, 0.08, 0.12, 1.0);
@@ -102,7 +103,7 @@ function paint() {
     var traceDrawn = false;
 
     if (buf && buf.framecount() > 0) {
-        var numSamples = Math.min(128, buf.framecount());
+        var numSamples = Math.min(256, buf.framecount());
         var left = buf.peek(1, 0, numSamples);
         var right = buf.peek(2, 0, numSamples);
 

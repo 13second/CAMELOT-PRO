@@ -1,6 +1,9 @@
-# macOS / exFAT metadata
+# macOS / Windows / exFAT metadata
 ._*
 .DS_Store
+Icon?
+desktop.ini
+Thumbs.db
 
 # Python caches
 __pycache__/
