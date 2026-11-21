@@ -1,0 +1,24 @@
+# macOS / exFAT metadata
+._*
+.DS_Store
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Backups & build outputs
+*.bak
+DIST/
+
+# Ableton & runtime generated artifacts
+Ableton Folder Info/
+camelot_session.json
+MIX ANALYSIS/*.wav
+MIX ANALYSIS/*.mp3
+MIX ANALYSIS/*.aif
+MIX ANALYSIS/*.aiff
+MIX ANALYSIS/*.flac
+MIX ANALYSIS/*.asd
+MIX ANALYSIS/Report_*.html
+MIX ANALYSIS/Contesto_AI_*.txt
